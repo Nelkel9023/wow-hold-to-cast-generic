@@ -6,3 +6,4 @@ tools/
 *.log
 *.obj
 *.pdb
+_publish*.ps1
