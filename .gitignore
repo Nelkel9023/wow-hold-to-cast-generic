@@ -1,4 +1,5 @@
-build/
+build/*
+!build/build.ps1
 third_party/
 tools/
 *.dll
