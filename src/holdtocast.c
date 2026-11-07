@@ -1,0 +1,261 @@
+/* HoldToCast native core - generic build for WoW 3.3.5a (build 12340).
+ *
+ * Standalone: no addon, no Lua, no network. Drop dinput8.dll next to Wow.exe.
+ * Refuses to hook if the running executable is not build 12340.
+ *
+ * Two cooperating hooks, both on the main thread:
+ *   - CGUIBindings::ExecKey fires for a key only when the game UI consumes it
+ *     as a binding (never while typing in a chat/edit box, never when the
+ *     window is unfocused). It records which key strings are currently held.
+ *   - CGWorldFrame::OnLayerUpdate runs every frame. For each action button's
+ *     bound key that is held and physically down, it calls the client's
+ *     CGActionBar::UseAction on the correct, page-aware slot.
+ *
+ * The slot is computed the same way the client's own FrameXML does
+ * (ActionButton_GetPagedID):
+ *   - bonus bar active:  slot = id + (NUM_ACTIONBAR_PAGES + bonusBarOffset - 1) * 12
+ *   - otherwise:         slot = id + currentPage * 12
+ * so page 1-6 paging, warrior stances, stealth, and druid shapeshift bars all
+ * cast the right button.
+ */
+#include <windows.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "MinHook.h"
+
+#define WOW_IMAGEBASE 0x00400000u
+static __inline void* va(uintptr_t a) {
+    return (void*)((uintptr_t)GetModuleHandleA(NULL) + (a - WOW_IMAGEBASE));
+}
+
+/* ---- client addresses (VAs, verified against Wow.exe) ---- */
+#define VA_CGWorldFrame_OnLayerUpdate    0x004FA040u
+#define VA_CGUIBindings_GetCommandKey    0x0055E750u
+#define VA_CGUIBindings_ExecKey          0x00563150u
+#define VA_CGActionBar_UseAction         0x005ABBC0u
+#define VA_m_currentPage                 0x00C1E598u
+#define VA_m_bonusBarOffset              0x00C1E59Cu
+#define VA_m_tempPageActiveFlags         0x00C1E5A0u
+#define VA_s_bindings                    0x00BEADD8u
+
+#define BINDING_MODE_ACTIVE 4
+#define NUM_ACTIONBAR_BUTTONS 12
+#define NUM_ACTIONBAR_PAGES   6
+#define NUM_ACTION_BUTTONS  NUM_ACTIONBAR_BUTTONS
+#define NUM_MULTI_BARS      4
+#define CAST_THROTTLE_MS    250
+#define BINDING_REFRESH_MS  1000
+#define MAX_ACTIVE_KEYS     64
+
+typedef void        (__attribute__((thiscall)) *fn_OnLayerUpdate)(void* self, float elapsedSec);
+typedef const char* (__attribute__((thiscall)) *fn_GetCommandKey)(void* self, int mode, const char* command, int index);
+typedef int32_t     (__attribute__((thiscall)) *fn_ExecKey)(void* self, uint32_t modifiers, const char* key, int32_t isDown, int32_t allowPressure, int mode);
+typedef void        (__cdecl *fn_UseAction)(int32_t slot, const void* target, const char* button);
+
+static fn_GetCommandKey     g_GetCommandKey;
+static fn_UseAction         g_UseAction;
+
+static fn_OnLayerUpdate     g_orig_update = NULL;
+static fn_ExecKey           g_orig_execkey = NULL;
+
+/* ---------------- logging ---------------- */
+static char g_logpath[MAX_PATH];
+static CRITICAL_SECTION g_loglock;
+static int g_loginit = 0;
+
+static void htc_log(const char* fmt, ...) {
+    if (!g_loginit || !g_logpath[0]) return;
+    EnterCriticalSection(&g_loglock);
+    FILE* f = fopen(g_logpath, "a");
+    if (f) {
+        va_list ap; va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+    LeaveCriticalSection(&g_loglock);
+}
+
+void HoldToCast_SetLogPath(const char* path) {
+    if (!g_loginit) { InitializeCriticalSection(&g_loglock); g_loginit = 1; }
+    lstrcpynA(g_logpath, path, MAX_PATH);
+}
+
+/* ---------------- key name -> virtual key ---------------- */
+static int KeyToVK(const char* key) {
+    if (!key || !key[0]) return 0;
+    const char* p = key;
+    const char* dash = NULL;
+    for (const char* q = key; *q; q++) if (*q == '-') dash = q;
+    if (dash) p = dash + 1;
+    if (p[0] >= '0' && p[0] <= '9' && p[1] == 0) return p[0];
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == 0)
+        return (p[0] >= 'a') ? (p[0] - 32) : p[0];
+    if (p[0] == 'F') {
+        int n = 0, i = 1;
+        while (p[i] >= '0' && p[i] <= '9') { n = n * 10 + (p[i] - '0'); i++; }
+        if (i > 1 && p[i] == 0 && n >= 1 && n <= 24) return 0x70 + (n - 1);
+    }
+    if (!lstrcmpiA(p, "NUMPADDECIMAL")) return 0x6E;
+    if (!_strnicmp(p, "NUMPAD", 6) && p[6] >= '0' && p[6] <= '9' && p[7] == 0) return 0x60 + (p[6] - '0');
+    return 0;
+}
+
+/* ---------------- held-key set (driven by ExecKey) ---------------- */
+typedef struct { char key[24]; } ActiveEntry;
+static ActiveEntry g_active[MAX_ACTIVE_KEYS];
+static int g_activeN = 0;
+
+static int ActiveFind(const char* k) {
+    if (!k || !k[0]) return -1;
+    for (int i = 0; i < g_activeN; i++)
+        if (!lstrcmpiA(g_active[i].key, k)) return i;
+    return -1;
+}
+static void ActiveAdd(const char* k) {
+    if (!k || !k[0] || ActiveFind(k) >= 0) return;
+    if (g_activeN >= MAX_ACTIVE_KEYS) g_activeN = 0;
+    lstrcpynA(g_active[g_activeN].key, k, 24);
+    g_activeN++;
+}
+static void ActiveDel(const char* k) {
+    int i = ActiveFind(k);
+    if (i < 0) return;
+    g_active[i] = g_active[g_activeN - 1];
+    g_activeN--;
+}
+
+/* ---------------- slot -> bound key ---------------- */
+static char g_slotKey[NUM_ACTION_BUTTONS][24];
+static int  g_slotVk[NUM_ACTION_BUTTONS];
+static char g_multiKey[NUM_MULTI_BARS][NUM_ACTION_BUTTONS][24];
+static int  g_multiVk[NUM_MULTI_BARS][NUM_ACTION_BUTTONS];
+/* Multi-bars show fixed pages 3-6; base is the 0-based first slot. */
+static const int g_multiBase[NUM_MULTI_BARS] = { 60, 48, 24, 36 };
+static HWND g_gameWnd = NULL;
+
+static void ResolveBindings(void) {
+    void* b = *(void**)va(VA_s_bindings);
+    if (!b) return;
+    char cmd[40];
+    for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+        wsprintfA(cmd, "ACTIONBUTTON%d", i + 1);
+        const char* k = g_GetCommandKey(b, BINDING_MODE_ACTIVE, cmd, 0);
+        if (k) { lstrcpynA(g_slotKey[i], k, 24); g_slotVk[i] = KeyToVK(k); }
+        else   { g_slotKey[i][0] = 0; g_slotVk[i] = 0; }
+    }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++) {
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            wsprintfA(cmd, "MULTIACTIONBAR%dBUTTON%d", bar + 1, i + 1);
+            const char* k = g_GetCommandKey(b, BINDING_MODE_ACTIVE, cmd, 0);
+            if (k) { lstrcpynA(g_multiKey[bar][i], k, 24); g_multiVk[bar][i] = KeyToVK(k); }
+            else   { g_multiKey[bar][i][0] = 0; g_multiVk[bar][i] = 0; }
+        }
+    }
+}
+/* Slot (0-based) for main-bar button s (0-based), matching
+ * ActionButton_GetPagedID in the client's FrameXML. */
+static int32_t PagedSlot(int s) {
+    int id = s + 1;
+    uint32_t bonus = *(uint32_t*)va(VA_m_bonusBarOffset);
+    uint32_t page  = *(uint32_t*)va(VA_m_currentPage);
+    uint32_t temp  = *(uint32_t*)va(VA_m_tempPageActiveFlags);
+    int slot1;
+    if (bonus)
+        slot1 = id + (NUM_ACTIONBAR_PAGES + (int)bonus - 1) * NUM_ACTIONBAR_BUTTONS;
+    else
+        slot1 = id + (temp ? 0 : (int)page) * NUM_ACTIONBAR_BUTTONS;
+    return slot1 - 1;
+}
+
+static void Tick(void) {
+    static DWORD lastResolve = 0, nextCast = 0;
+    DWORD now = GetTickCount();
+
+    if (now - lastResolve >= BINDING_REFRESH_MS) { ResolveBindings(); lastResolve = now; }
+    if (g_activeN == 0 || now < nextCast) return;
+
+    int busy = 0;
+    for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
+        if (!g_slotKey[s][0]) continue;
+        int idx = ActiveFind(g_slotKey[s]);
+        int down = g_slotVk[s] && (GetAsyncKeyState(g_slotVk[s]) & 0x8000);
+        if (idx >= 0 && !down) { ActiveDel(g_slotKey[s]); idx = -1; }
+        if (idx >= 0) busy = 1;
+    }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++)
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            if (!g_multiKey[bar][i][0]) continue;
+            int idx = ActiveFind(g_multiKey[bar][i]);
+            int down = g_multiVk[bar][i] && (GetAsyncKeyState(g_multiVk[bar][i]) & 0x8000);
+            if (idx >= 0 && !down) { ActiveDel(g_multiKey[bar][i]); idx = -1; }
+            if (idx >= 0) busy = 1;
+        }
+    if (!busy) return;
+    if (!g_gameWnd) g_gameWnd = GetForegroundWindow();
+    if (g_gameWnd && GetForegroundWindow() != g_gameWnd) return;
+
+    for (int s = 0; s < NUM_ACTION_BUTTONS; s++) {
+        if (!g_slotKey[s][0]) continue;
+        if (ActiveFind(g_slotKey[s]) >= 0 && (g_slotVk[s] && (GetAsyncKeyState(g_slotVk[s]) & 0x8000))) {
+            unsigned long long guid = 0;
+            g_UseAction(PagedSlot(s), &guid, NULL);
+        }
+    }
+    for (int bar = 0; bar < NUM_MULTI_BARS; bar++)
+        for (int i = 0; i < NUM_ACTION_BUTTONS; i++) {
+            if (!g_multiKey[bar][i][0]) continue;
+            if (ActiveFind(g_multiKey[bar][i]) >= 0 && (g_multiVk[bar][i] && (GetAsyncKeyState(g_multiVk[bar][i]) & 0x8000))) {
+                unsigned long long guid = 0;
+                g_UseAction(g_multiBase[bar] + i, &guid, NULL);
+            }
+        }
+    nextCast = now + CAST_THROTTLE_MS;
+}
+
+static void __attribute__((thiscall)) hook_OnLayerUpdate(void* self, float dt) {
+    g_orig_update(self, dt);
+    Tick();
+}
+
+static int32_t __attribute__((thiscall)) hook_ExecKey(void* self, uint32_t modifiers, const char* key, int32_t isDown, int32_t allowPressure, int mode) {
+    if (isDown) ActiveAdd(key); else ActiveDel(key);
+    return g_orig_execkey(self, modifiers, key, isDown, allowPressure, mode);
+}
+
+/* ---------------- init ---------------- */
+/* Hardcoded addresses only hold for the stock 3.3.5a client (build 12340).
+ * Refuse to hook anything else rather than patch the wrong bytes. */
+static int is_build_12340(void) {
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) return 0;
+    return nt->FileHeader.TimeDateStamp == 0x4C2452FEu;
+}
+
+void HoldToCast_Init(void) {
+    htc_log("HoldToCast_Init wowbase=%p", (void*)GetModuleHandleA(NULL));
+
+    if (!is_build_12340()) {
+        htc_log("not build 12340 (stock 3.3.5a) - disabled");
+        return;
+    }
+
+    g_GetCommandKey    = (fn_GetCommandKey)va(VA_CGUIBindings_GetCommandKey);
+    g_UseAction        = (fn_UseAction)va(VA_CGActionBar_UseAction);
+
+    if (MH_Initialize() != MH_OK) { htc_log("MH_Initialize FAILED"); return; }
+
+    if (MH_CreateHook(va(VA_CGWorldFrame_OnLayerUpdate), (LPVOID)&hook_OnLayerUpdate, (LPVOID*)&g_orig_update) == MH_OK)
+        MH_EnableHook(va(VA_CGWorldFrame_OnLayerUpdate));
+    if (MH_CreateHook(va(VA_CGUIBindings_ExecKey), (LPVOID)&hook_ExecKey, (LPVOID*)&g_orig_execkey) == MH_OK)
+        MH_EnableHook(va(VA_CGUIBindings_ExecKey));
+
+    htc_log("hooks: update=%p execkey=%p", (void*)g_orig_update, (void*)g_orig_execkey);
+}
